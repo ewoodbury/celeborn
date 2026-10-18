@@ -19,7 +19,10 @@ package org.apache.celeborn.service.deploy.worker.storage
 
 import java.{lang, util}
 import java.io.IOException
+import java.nio.file.Files
+import java.util.concurrent.ConcurrentHashMap
 
+import org.apache.commons.io.FileUtils
 import org.mockito.{Mockito, MockitoSugar}
 import org.mockito.ArgumentMatchersSugar.any
 import org.mockito.stubbing.Stubber
@@ -28,7 +31,7 @@ import org.apache.celeborn.CelebornFunSuite
 import org.apache.celeborn.common.CelebornConf
 import org.apache.celeborn.common.CelebornConf.{WORKER_DISK_RESERVE_SIZE, WORKER_GRACEFUL_SHUTDOWN_ENABLED, WORKER_GRACEFUL_SHUTDOWN_RECOVER_PATH, WORKER_STORAGE_DIRS}
 import org.apache.celeborn.common.identity.UserIdentifier
-import org.apache.celeborn.common.meta.{DiskInfo, DiskStatus}
+import org.apache.celeborn.common.meta.{DiskInfo, DiskStatus, MemoryFileInfo, ReduceFileMeta}
 import org.apache.celeborn.common.protocol.{PartitionLocation, PartitionType, StorageInfo}
 import org.apache.celeborn.common.util.Utils
 import org.apache.celeborn.service.deploy.worker.WorkerSource
@@ -144,6 +147,60 @@ class StorageManagerSuite extends CelebornFunSuite with MockitoHelper {
           s"No available disks! suggested mountPoint ${partitionLocation.getStorageInfo.getMountPoint}"))
       case e: Throwable =>
         fail(s"Should throw IOException, but got ${e.getClass.getSimpleName}", e)
+    }
+  }
+
+  test("cleanFile destroys an HDFS writer whether or not the shuffle has memory files") {
+    val hdfsDir = Files.createTempDirectory("celeborn-hdfs")
+    val conf = new CelebornConf()
+      .set("celeborn.storage.availableTypes", "MEMORY,HDFS")
+      .set("celeborn.storage.hdfs.dir", hdfsDir.toUri.toString)
+      .set("celeborn.worker.flusher.hdfs.threads", "1")
+      .set("celeborn.hadoop.fs.file.impl.disable.cache", "true")
+    val hadoopFsBefore = StorageManager.hadoopFs
+    val storageManager = new StorageManager(conf, new WorkerSource(conf))
+    val userIdentifier = new UserIdentifier("t1", "u1")
+    try {
+      // shuffle id -> memory files already registered for that shuffle (None: no memory map)
+      Seq(1 -> None, 2 -> Some(Seq.empty), 3 -> Some(Seq("1-0-1"))).foreach {
+        case (shuffleId, memoryFiles) =>
+          val shuffleKey = s"app-$shuffleId"
+          val fileName = "0-0-1"
+          memoryFiles.foreach { names =>
+            val files = new ConcurrentHashMap[String, MemoryFileInfo]()
+            names.foreach(files.put(
+              _,
+              new MemoryFileInfo(userIdentifier, false, new ReduceFileMeta(1024))))
+            storageManager.memoryFileInfos.put(shuffleKey, files)
+          }
+          val location =
+            new PartitionLocation(0, 0, "localhost", 0, 0, 0, 0, PartitionLocation.Mode.REPLICA)
+          location.setStorageInfo(
+            new StorageInfo("", StorageInfo.Type.HDFS, StorageInfo.ALL_TYPES_AVAILABLE_MASK))
+          val (_, fileInfo, _) = storageManager.createDiskFile(
+            location,
+            "app",
+            shuffleId,
+            fileName,
+            userIdentifier,
+            PartitionType.REDUCE,
+            partitionSplitEnabled = false,
+            StorageInfo.Type.HDFS)
+          val writer = mock[PartitionDataWriter]
+          storageManager.hdfsWriters.put(fileInfo.getFilePath, writer)
+
+          storageManager.cleanFile(shuffleKey, fileName)
+
+          withClue(s"memory files $memoryFiles") {
+            verify(writer).destroy(any[IOException])
+            assert(storageManager.getFileInfo(shuffleKey, fileName) == null)
+          }
+      }
+    } finally {
+      // StorageManager.close() would also shut down the static device check pool other suites use.
+      StorageManager.hadoopFs.get(StorageInfo.Type.HDFS).close()
+      StorageManager.hadoopFs = hadoopFsBefore
+      FileUtils.deleteDirectory(hdfsDir.toFile)
     }
   }
 
